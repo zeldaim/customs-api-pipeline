@@ -3,6 +3,8 @@ Airflow DAG - 리테일 매출 ETL (매일 01:00)
 1. raw 적재 확인 (Kafka retail-consumer 가 쌓은 JSONL)
 2. 검증/정제/집계 (etl/retail_etl.py)
 3. 품질 게이트: 규칙 위반 비율이 임계치를 넘으면 실패 처리
+4. ML 이상탐지: 관세 파이프라인과 같은 IF · LOF · Autoencoder (etl/retail_anomaly.py)
+5. 리포트: quality/report.html 생성 (etl/retail_report.py)
 """
 import json
 import sys
@@ -30,6 +32,16 @@ def run_etl():
     return retail_etl.run()["clean"]
 
 
+def detect_anomalies():
+    import retail_anomaly
+    return retail_anomaly.run()["majority"]
+
+
+def build_report():
+    import retail_report
+    return retail_report.build()
+
+
 def quality_gate():
     with open(REPORT, encoding="utf-8") as f:
         rep = json.load(f)
@@ -49,7 +61,7 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     catchup=False,
     default_args=default_args,
-    tags=["retail", "etl", "data-quality", "kafka"],
+    tags=["retail", "etl", "data-quality", "kafka", "ml"],
 ) as dag:
 
     check_raw = BashOperator(
@@ -62,4 +74,8 @@ with DAG(
 
     gate = PythonOperator(task_id="quality_gate", python_callable=quality_gate)
 
-    check_raw >> etl >> gate
+    detect = PythonOperator(task_id="detect_anomalies", python_callable=detect_anomalies)
+
+    report = PythonOperator(task_id="build_report", python_callable=build_report)
+
+    check_raw >> etl >> [gate, detect] >> report

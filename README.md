@@ -5,14 +5,15 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
 | 파이프라인 | 데이터 | 하는 일 | Airflow DAG |
 |---|---|---|---|
 | **① 관세 API 보안 로그** | 모의 관세 API 트래픽 (정상 + 공격) | 로그 수집 → 피처 추출 → IF·LOF·Autoencoder 앙상블 이상탐지 | `customs_api_pipeline` (5분마다) |
-| **② 리테일 매출 ETL** | 실제 매출 거래 5,000건 | Kafka 재생 → 검증·정제 → 일·월 집계 마트 + 데이터 품질 리포트 | `retail_daily_pipeline` (매일 01:00) |
+| **② 리테일 매출 ETL** | 실제 매출 거래 5,000건 | Kafka 재생 → 검증·정제 → 일·월 집계 + 품질 리포트 + 같은 ML 앙상블로 거래 이상탐지 | `retail_daily_pipeline` (매일 01:00) |
 
 **핵심 포인트**
 
 - 공격 IP(Shadow API 탐색, BOLA)를 **3개 모델 모두 이상으로 탐지**
-- Kafka at-least-once 전달로 생긴 **재전달 중복 687건을 ETL에서 제거** (consumer 재시작 상황에서 실제 발생)
+- producer 재실행으로 **같은 이벤트가 5,217건 중복 적재된 장애를 ETL이 `event_seq`로 걸러냄** → 원인을 찾아 producer에 체크포인트 추가
 - 규칙 위반 비율이 임계치를 넘으면 DAG를 실패시키는 **품질 게이트**
 - 원천 데이터 자체의 이상 신호(매출액-수량 무상관, 샘플링 흔적)를 **품질 리포트에 경고로 기록**
+- 관세 파이프라인의 **IF·LOF·Autoencoder 모듈을 리테일에 그대로 재사용**하고, 룰 기반 결과와 비교
 
 ![Airflow DAG 목록](docs/screenshots/06_airflow_dags_both.png)
 
@@ -39,7 +40,9 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
  │  customs_api_pipeline (5분)             retail_daily_pipeline (매일)  │
  │  check_log_file                         check_raw_events              │
  │   → run_anomaly_detection                → validate_clean_aggregate   │
- │   → print_results                        → quality_gate               │
+ │   → print_results                        → quality_gate │ 병렬        │
+ │                                            detect_anomalies │         │
+ │                                          → build_report (HTML)        │
  └───────────────────────────────────────────────────────────────────────┘
             ▼                                           ▼
  data/results/detection_results.jsonl     data/retail/{clean,quality,mart}/
@@ -86,7 +89,7 @@ Shadow API 탐색 IP(`192.168.99.100`)와 BOLA IP(`10.0.0.55`)가 세 모델 모
 
 | 단계 | 규칙 | 처리 |
 |---|---|---|
-| 전달 중복 | 같은 `event_seq` 재수신 (Kafka at-least-once) | 제거 |
+| 이벤트 중복 | 같은 `event_seq`가 여러 번 적재 (producer 재실행, Kafka 재전달) | 제거 |
 | 스키마 | 필수 컬럼 누락, 날짜·숫자 파싱 실패, 미래 날짜 | rejected |
 | 값 범위 | 매출액·수량 ≤ 0, 소수 수량, 상한 초과 | rejected |
 | 업무 중복 | 날짜·매장·상품·금액·수량이 동일한 거래 | rejected |
@@ -101,23 +104,41 @@ Shadow API 탐색 IP(`192.168.99.100`)와 BOLA IP(`10.0.0.55`)가 세 모델 모
 | `quality/rejected.jsonl` | 규칙 위반 거래 + 사유 |
 | `quality/flagged.jsonl` | 단가 이상치 거래 |
 | `quality/report.json` | 품질 리포트 (건수, 비율, 경고) |
+| `quality/ml_anomalies.jsonl`, `quality/ml_summary.json` | ML 이상탐지 결과, 룰과의 비교 |
+| `quality/report.html` | 위 결과를 모은 HTML 리포트 (`build_report` 태스크) |
 | `mart/daily_sales.csv`, `mart/monthly_sales.csv` | 일·월 매출 집계 |
 
 **실행 결과**
 
 | 지표 | 값 |
 |---|---|
-| 적재 라인 / 고유 이벤트 | 5,687 / 5,000 |
-| Kafka 재전달 중복 제거 | 687건 (consumer 재시작 시 미커밋 오프셋 재수신) |
+| 적재 라인 / 고유 이벤트 | 10,217 / 5,000 |
+| 중복 이벤트 제거 | 5,217건 (아래 '중복 적재 장애' 참고) |
 | 규칙 위반 | 0건 |
 | 단가 이상치 | 69건 (1.4%) — 예: 1개에 984.22, 29개에 13.11 |
 | 집계 | 484일 / 16개월 |
 
 품질 리포트는 원천 데이터 자체의 특성도 경고로 남긴다. 매출액-수량 상관이 −0.016으로 거의 없고(금액 익명화·노이즈 가능성), 3,834개 매장 대부분이 거래 1건뿐이다(샘플링 가능성). 그래서 매장·상품 단위 분석보다 **파이프라인과 데이터 품질 검증**에 초점을 맞췄다.
 
+**ML 이상탐지** (`etl/retail_anomaly.py`)
+
+관세 파이프라인의 `detector/models.py`(IF · LOF · Autoencoder)를 그대로 가져다 쓴다. 피처는 log(매출액), log(수량), log(단가), 모델별 상위 2%를 이상으로 보고 **3개 중 2개 이상 동의한 거래**만 남긴다.
+
+| 지표 | 값 |
+|---|---|
+| 모델별 이상 | IF 100 · LOF 100 · AE 100 |
+| 2개 이상 동의 / 3개 모두 | 81 / 20 |
+| 룰(단가 z-score) 이상치 69건 중 ML도 잡은 것 | 28건 (41%) |
+
+해석: 단가가 극단적인 거래(예: 31개에 10.82원)는 룰과 ML이 함께 잡는다. 나머지 ML 결과는 금액·수량이 범위 끝에 몰린 거래들로, 이 데이터가 거의 균일하게 퍼져 있어서 '정상 패턴'이 약하다는 뜻이기도 하다. contamination을 정하면 모델은 항상 그 비율만큼 이상을 내놓기 때문에, **룰 결과와 겹치는 정도로 ML 결과를 검증**하도록 했다.
+
+**품질 리포트** — DAG의 마지막 태스크 `build_report`가 매 실행마다 `quality/report.html`을 만든다. 아래는 그 파일을 그대로 캡처한 것이다.
+
 ![품질 리포트](docs/screenshots/10_retail_quality_report.png)
 
-> 위 화면은 `quality/report.json`, `quality/flagged.jsonl`, `mart/monthly_sales.csv`를 `tools/screenshot_retail.js`가 HTML로 그려 캡처한 것이다. 같은 경고는 Airflow `quality_gate` 태스크 로그에도 출력된다.
+**중복 적재 장애와 해결**
+
+리포트에서 적재 라인(10,217)이 실제 거래(5,000)의 두 배 가까이 나왔다. 확인해 보니 `docker compose up`으로 consumer를 재시작할 때 이미 끝난 producer도 다시 실행되면서 5,000건을 처음부터 다시 보낸 것이었다. ETL은 `event_seq` 기준으로 중복을 제거하고 있어서 정제 결과(5,000건)와 집계는 영향을 받지 않았다. 원인을 막기 위해 producer가 보낸 마지막 `event_seq`를 체크포인트 파일에 기록하고 재시작하면 그다음부터 보내도록 고쳤다 — 이제 다시 실행해도 `already replayed, nothing to send`로 끝난다. ETL의 중복 제거는 Kafka 재전달 같은 다른 경로를 위한 안전장치로 남겨 둔다.
 
 | DAG 그래프 | 품질 게이트 로그 |
 |---|---|

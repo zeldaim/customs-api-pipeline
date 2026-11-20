@@ -36,7 +36,7 @@ def _path(*parts):
 
 
 def load_raw():
-    """raw JSONL 로드. Kafka at-least-once 전달로 생긴 중복은 event_seq 로 제거."""
+    """raw JSONL 로드. 같은 event_seq 가 여러 번 들어온 중복(producer 재실행, Kafka 재전달)은 제거."""
     events, seen, redelivered, broken = [], set(), 0, 0
     if not os.path.exists(RAW):
         raise FileNotFoundError(f"raw 파일 없음: {RAW} (retail-producer/consumer 실행 확인)")
@@ -188,7 +188,7 @@ def run():
         "run_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "raw_lines": total + redelivered + broken,
         "unique_events": total,
-        "redelivered_dropped": redelivered,
+        "duplicate_events_dropped": redelivered,
         "broken_lines": broken,
         "clean": len(clean),
         "rejected": len(rejected),
