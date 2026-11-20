@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+
+  # ── 관세 API 서버 (가짜) ──────────────────────────────
+  customs-api:
+    build: ./api
+    container_name: customs-api
+    ports:
+      - "8080:8080"
+    networks:
+      - pipeline-net
+
+  # ── Kafka ─────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - pipeline-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - pipeline-net
+
+  # ── Kafka Producer (API 로그 → Kafka) ─────────────────
+  producer:
+    build: ./kafka
+    container_name: kafka-producer
+    command: python producer.py
+    depends_on:
+      - kafka
+      - customs-api
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      API_URL: http://customs-api:8080
+    networks:
+      - pipeline-net
+
+  # ── Kafka Consumer (Kafka → DB) ───────────────────────
+  consumer:
+    build: ./kafka
+    container_name: kafka-consumer
+    command: python consumer.py
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./data:/app/data
+    networks:
+      - pipeline-net
+
+  # ── Airflow ───────────────────────────────────────────
+  airflow:
+    image: apache/airflow:2.9.1
+    container_name: airflow
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: customs-pipeline-secret
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./data:/opt/airflow/data
+      - ./detector:/opt/airflow/detector
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --password admin
+                 --firstname Admin --lastname User
+                 --role Admin --email admin@example.com &&
+               airflow webserver & airflow scheduler"
+    networks:
+      - pipeline-net
+
+networks:
+  pipeline-net:
+    driver: bridge
