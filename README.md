@@ -74,6 +74,15 @@ Retail Producer ──▶ Topic: retail-sales ──▶ Retail Consumer
 
 > 원본 CSV(`data/raw/`)와 생성 결과(`data/retail/`)는 저장소에 올리지 않는다.
 
+**스크린샷**
+
+| DAG 그래프 | 품질 게이트 로그 |
+|---|---|
+| ![](docs/screenshots/08_retail_dag_graph.png) | ![](docs/screenshots/09_retail_quality_gate_log.png) |
+
+![품질 리포트](docs/screenshots/10_retail_quality_report.png)
+
+
 ## 빠른 시작
 
 ```bash
