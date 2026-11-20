@@ -4,7 +4,7 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
 
 | 파이프라인 | 데이터 | 하는 일 | Airflow DAG |
 |---|---|---|---|
-| **① 관세 API 보안 로그** | 모의 관세 API 트래픽 (정상 + 공격) | 로그 수집 → 피처 추출 → IF·LOF·Autoencoder 앙상블 이상탐지 | `customs_api_pipeline` (5분마다) |
+| **① 관세 API 보안 로그** | 모의 관세 API가 직접 남긴 access log (정상 + 공격 트래픽) | 로그 수집 → 피처 추출 → z-score 비교군 + IF·LOF·Autoencoder → 정답 라벨로 precision/recall 평가 | `customs_api_pipeline` (5분마다) |
 | **② 리테일 매출 ETL** | Airflow 튜토리얼 매출 데이터 5,000건 (합성) | Kafka 재생 → 검증·정제 → 일·월 집계 → **품질 리포트** (+ 같은 ML 앙상블로 거래 이상탐지) | `retail_daily_pipeline` (매일 01:00) |
 
 **핵심 포인트**
@@ -12,7 +12,8 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
 - **품질 리포트가 원천 데이터의 문제를 먼저 찾아냄** — 매 실행마다 HTML 리포트 한 장을 만들고, 그 리포트에서 ① 원천 데이터가 합성(컬럼별 독립 난수)이라는 사실(균일 분포 χ² 검사로 자동 경고)과 ② 이벤트가 두 배로 적재된 장애가 드러남
 - 규칙 위반 비율이 5%를 넘으면 DAG를 실패시키는 **품질 게이트** — 불량 이벤트 400건(7종)을 Kafka로 주입해 **게이트가 실제로 DAG를 멈추는 것까지 확인**
 - producer 재실행으로 **같은 이벤트가 5,217건 중복 적재된 장애를 ETL이 `event_seq`로 걸러냄** → 원인을 찾아 producer에 체크포인트 추가
-- 공격 IP(Shadow API 탐색, BOLA)를 **3개 모델 모두 이상으로 탐지**
+- 관세 API 탐지는 **서버가 남긴 access log만** 피처로 쓰고, 정답 라벨은 분리해 **precision/recall로 평가** — 결과는 ML이 아닌 robust z-score(P 0.923, R 1.0)가 IF·LOF(P 0.857)보다 낫고, IF·LOF는 contamination 설정에 따라 크게 흔들림 (이전 버전의 라벨 누수 제거)
+- 수집 공백(호스트 일시정지)이 오탐으로 번지는 것을 실측하고, **완료되지 않은 윈도우·수집 공백 윈도우를 채점에서 빼는 검사** 추가
 - 관세 파이프라인의 **IF·LOF·Autoencoder 모듈을 리테일에 그대로 재사용**하고, 룰 기반 결과와 비교
 
 ![Airflow DAG 목록](docs/screenshots/06_airflow_dags_both.png)
@@ -22,10 +23,12 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
 ## 전체 아키텍처
 
 ```
- ① 관세 API (Flask)                         ② retail_sales_performance.csv
-    정상 + Shadow API 탐색 + BOLA              날짜순 replay (초당 50건, key=store_id)
-            │                                           │
-     Kafka Producer                              Retail Producer
+ 트래픽 생성기 ──▶ 정답 라벨                  ② retail_sales_performance.csv
+ (정상 + Shadow      data/labels/ (평가 전용)     날짜순 replay (초당 50건, key=store_id)
+  API 탐색 + BOLA)                                      │
+            │ HTTP (X-Forwarded-For)                    │
+            ▼                                           │
+ ① 관세 API (Flask) — access log 를 직접 전송     Retail Producer
             │                                           │
             ▼                                           ▼
  ┌──────────────────────── Kafka (Confluent 7.6) ────────────────────────┐
@@ -45,35 +48,82 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
  │                                          → quality_gate (판정)        │
  └───────────────────────────────────────────────────────────────────────┘
             ▼                                           ▼
- data/results/detection_results.jsonl     data/retail/{clean,quality,mart}/
+ data/results/{detection_results.jsonl,   data/retail/{clean,quality,mart}/
+               evaluation.json}
 ```
 
 ---
 
 ## ① 관세 API 보안 로그 — 이상탐지
 
-모의 관세 API(HS 코드 조회, 수입 통계, 수입 신고)에 정상 사용자 트래픽과 공격 트래픽을 섞어 보내고, 그 로그로 공격자를 찾는다.
+모의 관세 API(HS 코드 조회, 수입 통계, 수입 신고)에 정상 사용자 트래픽과 공격 트래픽을 섞어 보내고, **API 서버가 남긴 access log만으로** 공격 IP를 찾는다. 정답 라벨은 따로 보관했다가 평가에만 쓴다.
 
 **탐지 대상**
 
 | 공격 유형 | 설명 |
 |---|---|
-| Shadow API 탐색 | 명세에 없는 경로 스캔 (`/admin`, `/internal/config` 등) |
-| BOLA | 다른 사용자의 수입 통계를 ID를 바꿔가며 무단 조회 |
+| Shadow API 탐색 | 명세에 없는 경로 스캔 (`/admin`, `/internal/config` 등) — 30 tick마다 3건 |
+| BOLA | 다른 사용자의 수입 통계를 ID를 바꿔가며 무단 조회 (`user_1`~`user_9`) — 50 tick마다 9건 |
 
-**탐지 방식** (`detector/`)
+정상 사용자 20명은 IP가 고정이고, HS 코드 조회·본인 통계 조회·수입 신고를 섞어 보낸다. HS 코드는 10% 확률로 오타를 내서 정상 사용자도 404를 낸다. 모든 클라이언트의 User-Agent는 같다.
 
-- **피처**: IP × 5분 윈도우 단위로 요청 수, 고유 경로 수, 에러 비율, 쓰기(POST) 비율, 엔드포인트 엔트로피 등을 집계
-- **모델**: Isolation Forest · LOF · Autoencoder 세 가지를 각각 돌려 결과를 함께 기록
+### 로그와 라벨의 분리
 
-**결과**
+| | 누가 만드나 | 들어가는 것 | 쓰는 곳 |
+|---|---|---|---|
+| access log (`data/logs/api_logs.jsonl`) | **API 서버** (`after_request` 훅 → Kafka) | 시각, IP(`X-Forwarded-For`), 메서드, 경로, 상태코드, 응답 크기, 지연, UA | 피처 → 탐지 |
+| 정답 라벨 (`data/labels/ground_truth.jsonl`) | 트래픽 생성기 | 시각, IP, `actor_type` (normal / shadow_probe / bola) | **평가에만** |
 
-```json
-{"src_ip": "192.168.99.100", "req_count": 9, "uniq_paths": 3, "shadow_count": 9,
- "anomaly_if": true, "anomaly_lof": true, "anomaly_ae": true}
-```
+> **이전 버전의 문제 (라벨 누수)** — 예전에는 트래픽 생성기가 로그를 직접 만들어 Kafka에 넣었고, 그 로그에 정답(`actor_type`)이 들어 있었다. 피처 `shadow_count`·`bola_count`가 그 정답을 세는 값이라 모델이 답을 보고 탐지하는 구조였고, "3개 모델 모두 탐지"라는 결과는 의미가 없었다. 지금은 로그를 서버가 만들고, 피처는 서버가 관찰할 수 있는 값만 쓴다.
 
-Shadow API 탐색 IP(`192.168.99.100`)와 BOLA IP(`10.0.0.55`)가 세 모델 모두에서 이상으로 탐지됐다.
+### 탐지 방식 (`detector/`)
+
+- **피처** (IP × 5분 윈도우): 요청 수, 고유 경로 수, 4xx/5xx 비율, POST 비율, 엔드포인트 엔트로피, 같은 엔드포인트에서 조회한 서로 다른 객체 ID 수(`/import-stats/{id}`)
+- **방법**: robust z-score(ML이 아닌 비교군, 피처별 median/MAD 중 최대 |z| ≥ 3) · Isolation Forest · LOF · Autoencoder (모델은 `detector/models.py`, contamination 0.1). 앙상블은 ML 3개 중 하나라도(`ml_any`) / 2개 이상(`ml_majority`)
+- **윈도우 처리**: 끝나지 않은 윈도우는 채점하지 않는다. 전체 요청 수가 중앙값의 절반 미만인 윈도우는 **수집 공백**으로 보고 채점에서 빼고 따로 알린다.
+- **평가**: 정답 라벨을 (IP, 윈도우)에 붙여 방법별 TP/FP/FN, precision/recall, 공격 유형별 탐지율을 `data/results/evaluation.json`에 기록. 결과 파일은 매 실행 전체 재계산 후 덮어쓴다.
+
+### 결과
+
+수집 약 30분, 요청 2,884건 → 채점 윈도우 132개(IP 22개 × 6구간), 그중 공격 윈도우 12개 (Shadow 6, BOLA 6).
+
+| 방법 | Precision | Recall | 오탐 | BOLA | Shadow 탐색 |
+|---|---|---|---|---|---|
+| **robust z-score (비교군, ML 아님)** | **0.923** | **1.0** | 1 | 6/6 | 6/6 |
+| Isolation Forest | 0.857 | 1.0 | 2 | 6/6 | 6/6 |
+| LOF | 0.857 | 1.0 | 2 | 6/6 | 6/6 |
+| Autoencoder | 0.429 | 0.5 | 8 | 6/6 | **0/6** |
+| ML 2개 이상 동의 | 0.8 | 1.0 | 3 | 6/6 | 6/6 |
+| ML 하나라도 | 0.6 | 1.0 | 8 | 6/6 | 6/6 |
+
+![탐지 평가 로그](docs/screenshots/14_customs_detection_eval_log.png)
+
+**해석 — ML이 비교군보다 낫지 않다**
+
+1. **ML이 아닌 z-score가 가장 좋다.** 공격이 피처 한두 개에서 극단값으로 드러나는 단순한 시나리오라서다. BOLA는 객체 ID 9개(정상 사용자는 1개), Shadow 탐색은 에러 비율 100%(정상 평균 5.1%).
+2. **IF·LOF 결과는 contamination 설정에 달려 있다.** 공격 윈도우 비율(12/132 = 9%)이 contamination 0.1과 우연히 비슷해서 좋아 보이는 것이다. 같은 데이터로 값만 바꾸면:
+
+   | contamination | IF P / R | LOF P / R | z-score P / R |
+   |---|---|---|---|
+   | 0.05 | 1.0 / 0.583 | 1.0 / 0.5 | 0.923 / 1.0 |
+   | 0.1 | 0.857 / 1.0 | 0.857 / 1.0 | 0.923 / 1.0 |
+   | 0.2 | 0.444 / 1.0 | 0.444 / 1.0 | 0.923 / 1.0 |
+
+   실제 환경에서는 공격 비율을 모르므로 이 값을 맞출 수 없다. z-score는 이 설정과 무관하다.
+3. **Autoencoder는 Shadow 탐색을 하나도 못 잡는다.** 요청 3~12건짜리 소규모 윈도우는 재구성 오차가 크지 않다. 반대로 정상 윈도우 8개를 오탐한다.
+4. **표본이 작다.** 공격 윈도우 12개, 공격 IP 2개뿐이라 수치 하나하나에 큰 의미를 두면 안 된다. 공격자가 정상처럼 섞여 들어오는 시나리오(저속 BOLA, 정상 요청에 섞인 스캔)를 추가해야 ML의 쓸모를 제대로 따질 수 있다.
+
+**수집 공백 — 실측**
+
+수집 중 호스트가 두 번 멈췄다(10:08~10:14, 10:19~10:38). 로그와 정답 라벨 건수가 끝까지 1:1로 일치해서 API → Kafka → 파일 구간의 **유실은 0건**이었다. 하지만 공백이 낀 10:10 윈도우는 IP당 요청이 2~9건(평소 중앙값 21)으로 줄었고, 이 윈도우까지 채점하면 결과가 이렇게 무너진다.
+
+| 10:10 윈도우 포함 시 | Precision | Recall |
+|---|---|---|
+| z-score | 0.583 | 1.0 |
+| Isolation Forest | 0.625 | 0.714 |
+| Autoencoder | 0.188 | 0.214 |
+
+수집 공백은 공격이 아니라 파이프라인 문제로 따로 알려야 한다. 그래서 수집 공백 검사(`drop_incomplete_windows`)를 넣어 해당 윈도우를 채점에서 빼고 로그에 `skip incomplete window ... collection gap`으로 남긴다. 검사를 끄려면 `CUSTOMS_SKIP_INCOMPLETE=0`. 비슷하게, 처음에는 끝나지 않은 윈도우(1분만 지난 윈도우)까지 채점해서 오탐 19건 중 18건이 그 윈도우에서 나왔다. 이것도 고쳤다.
 
 | DAG 그래프 | DAG 실행 기록 |
 |---|---|
@@ -237,9 +287,9 @@ docker compose up -d --build
 
 ```
 customs-api-pipeline/
-├── api/                  # 모의 관세 API (Flask)
+├── api/                  # 모의 관세 API (Flask) — access log 를 Kafka 로 직접 전송
 ├── kafka/                # Producer / Consumer (관세 + 리테일), 게이트 시연용 불량 주입
-├── detector/             # ① 피처 추출 + IF·LOF·Autoencoder 이상탐지
+├── detector/             # ① 피처 추출 + z-score·IF·LOF·Autoencoder 탐지 + 정답 라벨 평가
 ├── etl/                  # ② 리테일 검증·정제·집계
 ├── airflow/dags/         # customs_pipeline.py, retail_daily_pipeline.py
 ├── data/                 # 실행 결과 (git 제외)

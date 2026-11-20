@@ -1,6 +1,7 @@
 airflow/logs/*
 data/logs/*
 data/results/*
+data/labels/*
 __pycache__/
 *.pyc
 .env

@@ -27,4 +27,4 @@ with open(OUTPUT_FILE, "a") as f:
         log = message.value
         f.write(json.dumps(log) + "\n")
         f.flush()
-        print(f"[CONSUMER] Saved: {log['actor_type']:12s} {log['path']}")
+        print(f"[CONSUMER] Saved: {log['src_ip']:15s} {log['method']} {log['path']} {log['status_code']}")

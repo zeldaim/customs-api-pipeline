@@ -2,12 +2,16 @@ version: '3.8'
 
 services:
 
-  # ── 관세 API 서버 (가짜) ──────────────────────────────
+  # ── 관세 API 서버 (모의) — access log 를 직접 Kafka 로 보냄 ──
   customs-api:
     build: ./api
     container_name: customs-api
+    depends_on:
+      - kafka
     ports:
       - "8080:8080"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     networks:
       - pipeline-net
 
@@ -36,21 +40,21 @@ services:
     networks:
       - pipeline-net
 
-  # ── Kafka Producer (API 로그 → Kafka) ─────────────────
+  # ── 트래픽 생성기 (정상 + 공격 → API, 정답 라벨은 data/labels 에 따로) ──
   producer:
     build: ./kafka
     container_name: kafka-producer
     command: python producer.py
     depends_on:
-      - kafka
       - customs-api
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       API_URL: http://customs-api:8080
+    volumes:
+      - ./data:/app/data
     networks:
       - pipeline-net
 
-  # ── Kafka Consumer (Kafka → DB) ───────────────────────
+  # ── Kafka Consumer (access log → JSONL) ──────────────
   consumer:
     build: ./kafka
     container_name: kafka-consumer
