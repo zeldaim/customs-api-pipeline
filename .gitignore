@@ -4,3 +4,6 @@ data/results/*
 __pycache__/
 *.pyc
 .env
+data/raw/*
+data/retail/*
+node_modules/

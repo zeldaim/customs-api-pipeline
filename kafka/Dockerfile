@@ -1,4 +1,4 @@
 FROM python:3.11-slim
 WORKDIR /app
 RUN pip install kafka-python requests
-COPY producer.py consumer.py ./
+COPY *.py ./

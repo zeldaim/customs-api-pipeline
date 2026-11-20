@@ -64,6 +64,36 @@ services:
     networks:
       - pipeline-net
 
+  # ── Retail Producer (CSV replay → Kafka) ───────────
+  retail-producer:
+    build: ./kafka
+    container_name: retail-producer
+    command: python retail_producer.py
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      RETAIL_RATE: "50"
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+    networks:
+      - pipeline-net
+
+  # ── Retail Consumer (Kafka → raw JSONL) ─────────────
+  retail-consumer:
+    build: ./kafka
+    container_name: retail-consumer
+    command: python retail_consumer.py
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./data:/app/data
+    networks:
+      - pipeline-net
+
   # ── Airflow ───────────────────────────────────────────
   airflow:
     image: apache/airflow:2.9.1
@@ -87,6 +117,7 @@ services:
       - ./airflow/plugins:/opt/airflow/plugins
       - ./data:/opt/airflow/data
       - ./detector:/opt/airflow/detector
+      - ./etl:/opt/airflow/etl
     command: bash -c "pip install scikit-learn pandas -q && airflow db migrate && airflow webserver & airflow scheduler"
     networks:
       - pipeline-net
