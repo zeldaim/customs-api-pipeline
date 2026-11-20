@@ -10,6 +10,8 @@ import html
 import json
 import os
 
+from retail_etl import MAX_REJECTED_RATE
+
 BASE = os.getenv("RETAIL_DATA_DIR", "/opt/airflow/data/retail")
 
 
@@ -51,7 +53,21 @@ th{color:var(--muted);font-weight:600}.bar{background:var(--bar);height:10px;bor
 .warn{background:var(--warnbg);border:1px solid var(--warnline);border-radius:8px;padding:10px 14px;margin:6px 0;font-size:14px}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:24px}
 .yes{font-weight:600}.no{color:var(--muted)}
+.gate{border-radius:8px;padding:12px 16px;margin:0 0 20px;font-size:15px;font-weight:600;border:1px solid}
+.gate.fail{background:var(--failbg);border-color:var(--failline)}.gate.pass{background:var(--passbg);border-color:var(--passline)}
+.gate .d{font-weight:400;font-size:13px;margin-top:4px}
+:root{--failbg:#ffebe9;--failline:#cf222e;--passbg:#dafbe1;--passline:#1a7f37}
+@media (prefers-color-scheme: dark){:root{--failbg:#3c1618;--failline:#da3633;--passbg:#0f2d1a;--passline:#2ea043}}
 """
+
+REASON_KO = {
+    "missing_store_id": "매장 ID 누락", "missing_date": "날짜 누락", "missing_product_id": "상품 ID 누락",
+    "missing_sales_amount": "매출액 누락", "missing_units_sold": "수량 누락",
+    "bad_date": "날짜 파싱 실패", "future_date": "미래 날짜", "bad_amount": "매출액 파싱 실패",
+    "non_positive_amount": "매출액 ≤ 0", "amount_too_large": "매출액 상한 초과",
+    "bad_units": "수량 파싱 실패", "fractional_units": "소수 수량", "non_positive_units": "수량 ≤ 0",
+    "units_too_large": "수량 상한 초과", "duplicate_transaction": "업무 중복 거래",
+}
 
 
 def build():
@@ -75,6 +91,28 @@ def build():
 {kpi('단가 이상치 (룰)', f"{rep['flagged_price_outliers']} ({rep['flagged_rate']:.1%})")}
 {kpi('ML 다수결 이상', n(ml['majority']) if ml else '-')}
 </div>"""]
+
+    failed = rep["rejected_rate"] > MAX_REJECTED_RATE
+    parts.append(
+        f'<div class="gate {"fail" if failed else "pass"}">'
+        f'{"✕ 품질 게이트 실패 - 이 실행의 마트는 사용하면 안 됨" if failed else "✓ 품질 게이트 통과"}'
+        f'<div class="d">규칙 위반 {n(rep["rejected"])} / {n(rep["unique_events"])}건 = {rep["rejected_rate"]:.2%}'
+        f' (기준 {MAX_REJECTED_RATE:.0%} 이하)</div></div>')
+
+    if rep["rejected"]:
+        examples = {}
+        for r in _read_jsonl("quality", "rejected.jsonl", limit=10**9):
+            for e in r["errors"]:
+                examples.setdefault(e, r)
+        parts.append('<h2>규칙 위반 사유 (quality/rejected.jsonl)</h2><table><tr><th>사유</th><th>건수</th>'
+                     '<th>날짜</th><th>매장</th><th>매출액</th><th>수량</th></tr>')
+        for reason, cnt in sorted(rep["rejected_by_reason"].items(), key=lambda x: -x[1]):
+            ex = examples.get(reason, {})
+            cells = "".join(f"<td>{html.escape(str(ex.get(c, '')))}</td>"
+                            for c in ("date", "store_id", "sales_amount", "units_sold"))
+            parts.append(f'<tr><td>{REASON_KO.get(reason, reason)} <span class="no">{reason}</span></td>'
+                         f'<td>{n(cnt)}</td>{cells}</tr>')
+        parts.append("</table>")
 
     if rep["warnings"]:
         parts.append("<h2>품질 경고</h2>" + "".join(f'<div class="warn">⚠ {html.escape(w)}</div>' for w in rep["warnings"]))

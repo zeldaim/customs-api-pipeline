@@ -26,6 +26,7 @@ RAW = os.path.join(BASE, "raw", "sales_events.jsonl")
 # 단가(sales_amount / units_sold) 이상치 기준: log 단가의 robust z-score
 PRICE_Z_THRESHOLD = float(os.getenv("PRICE_Z_THRESHOLD", "3.5"))
 MAX_UNITS = 10_000          # 한 거래에 이 이상이면 입력 오류로 간주
+MAX_REJECTED_RATE = 0.05    # 품질 게이트: 규칙 위반 비율이 이보다 크면 DAG 실패 (DAG·리포트가 같이 쓴다)
 MAX_AMOUNT = 1_000_000
 
 
@@ -204,6 +205,8 @@ def run():
         "unique_products": len({r["product_id"] for r in clean}),
         # 매출액과 판매수량은 보통 강한 양의 상관. 0 근처면 원천 데이터 의심 신호.
         "corr_amount_units": round(statistics.correlation(amounts, units), 3),
+        # 실제 거래의 금액·수량은 소액/소량 쪽에 몰린다. 균일 분포와 구분이 안 되면 난수 생성 의심.
+        "uniform_chi2": {"sales_amount": uniform_chi2(amounts), "units_sold": uniform_chi2(units)},
     }
     report["warnings"] = quality_warnings(report)
     with open(_path("quality", "report.json"), "w", encoding="utf-8") as f:
@@ -213,9 +216,31 @@ def run():
     return report
 
 
+UNIFORM_BINS = 10
+# 자유도 9, 유의수준 1%의 카이제곱 임계값. 이보다 작으면 "균일 분포가 아니다"라고 말할 근거가 없다.
+UNIFORM_CHI2_CRIT = 21.67
+
+
+def uniform_chi2(values, bins=UNIFORM_BINS):
+    """[min, max]를 같은 폭 bins개 구간으로 나눠, 균일 분포 기대 빈도와의 카이제곱 통계량."""
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return None
+    counts = [0] * bins
+    for v in values:
+        counts[min(bins - 1, int((v - lo) / (hi - lo) * bins))] += 1
+    exp = len(values) / bins
+    return round(sum((c - exp) ** 2 / exp for c in counts), 2)
+
+
 def quality_warnings(rep):
     w = []
-    if rep["rejected_rate"] > 0.05:
+    chi = rep["uniform_chi2"]
+    uniform = [k for k, v in chi.items() if v is not None and v < UNIFORM_CHI2_CRIT]
+    if len(uniform) == len(chi):
+        w.append("매출액·수량이 모두 균일 분포와 구분되지 않음 "
+                 f"(χ² {chi['sales_amount']}, {chi['units_sold']} < {UNIFORM_CHI2_CRIT}) - 난수로 생성된 합성 데이터일 가능성")
+    if rep["rejected_rate"] > MAX_REJECTED_RATE:
         w.append(f"규칙 위반 비율 {rep['rejected_rate']:.1%} - 원천 시스템 점검 필요")
     if rep["flagged_rate"] > 0.02:
         w.append(f"단가 이상치 비율 {rep['flagged_rate']:.1%} - 가격/수량 입력 검토 필요")
