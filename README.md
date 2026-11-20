@@ -15,6 +15,7 @@ Kafka 실시간 스트리밍 + Airflow 스케줄링 기반 데이터 파이프�
 - 관세 API 탐지는 **서버가 남긴 access log만** 피처로 쓰고, 정답 라벨은 분리해 **precision/recall로 평가** — 결과는 ML이 아닌 robust z-score(P 0.923, R 1.0)가 IF·LOF(P 0.857)보다 낫고, IF·LOF는 contamination 설정에 따라 크게 흔들림 (이전 버전의 라벨 누수 제거)
 - 수집 공백(호스트 일시정지)이 오탐으로 번지는 것을 실측하고, **완료되지 않은 윈도우·수집 공백 윈도우를 채점에서 빼는 검사** 추가
 - 관세 파이프라인의 **IF·LOF·Autoencoder 모듈을 리테일에 그대로 재사용**하고, 룰 기반 결과와 비교
+- **공급망 CI** — API-BOM(소스↔승인 기준선 게이트) · 이미지 SBOM · 취약점 · 빌드 재현성을 CycloneDX 1.6 으로 만들고 보고서 한 장으로 정리. 자기 레포를 검사해 **Airflow 2.x 지원 종료**, **시작할 때마다 `pip install` → 실행 코드가 SBOM 밖**인 문제를 찾음
 
 ![Airflow DAG 목록](docs/screenshots/06_airflow_dags_both.png)
 
@@ -264,6 +265,23 @@ docker compose start retail-consumer                                            
 
 ---
 
+## 공급망 — API-BOM · SBOM · 보고서 (`supply-chain/`)
+
+push·PR·매주 월요일마다 CI(`.github/workflows/supply-chain.yml`)가 이 레포 자신을 검사한다. 자세한 내용은 [supply-chain/README.md](supply-chain/README.md).
+
+| 단계 | 내용 | 실패 시 |
+|---|---|---|
+| API-BOM 게이트 | `api/app.py` 라우트(ast 추출) ↔ 승인 기준선 `baseline.csv` 비교 → CycloneDX 1.6 API-BOM → 공식 스키마 검증 | **CI 실패** |
+| SBOM · 취약점 | 이미지 3개(customs-api · kafka-clients · airflow) syft → grype | 보고서 |
+| 빌드 재현성 · EOL | 버전 미고정 pip(B1) · digest 미고정(B2) · 시작 시 설치(B3) · 의존성 목록 없음(B4) · 지원 종료(S3) | 보고서 |
+
+**첫 실행 결과** ([보고서 전문](supply-chain/reports/2026-11-21_공급망_보고서.md)) — 기준 위반 높음 12 · 중간 8 · 낮음 1
+
+- **S3** Airflow 2.x 는 2026-04-22 지원 종료 — 이 레포는 `apache/airflow:2.9.1` 사용
+- **B3** Airflow 가 시작할 때마다 `pip install scikit-learn pandas` → 이미지 SBOM 에 scikit-learn 이 없음을 SBOM 으로 확인. 탐지·ETL 을 실제로 돌리는 코드가 SBOM 밖에 있다
+- **S1** 고유 CVE Critical 62 · High 377, 대부분 Airflow 이미지(curl·openssl·rsync·Go stdlib 등 2024년 빌드 부품). 직접 빌드하는 두 이미지는 Critical 0 · High 27
+- **G4** `GET /api/v1/import-stats/{id}` 인증 없음 — 샘플 로그에서 한 IP 가 서로 다른 객체 9개 조회(의도된 BOLA 실습 취약점)
+
 ## 빠른 시작
 
 ```bash
@@ -300,6 +318,8 @@ customs-api-pipeline/
 ├── docs/
 │   ├── screenshots/
 │   └── troubleshooting.md
+├── supply-chain/         # API-BOM · SBOM · 빌드 재현성 검사 → 보고서 (CI 와 로컬 공통 run.sh)
+├── .github/workflows/    # supply-chain.yml
 ├── tools/                # 스크린샷 자동화 (Puppeteer, `fail` 인자로 게이트 실패 화면)
 └── docker-compose.yml
 ```

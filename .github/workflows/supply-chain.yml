@@ -1,0 +1,58 @@
+# 공급망 파이프라인: API-BOM · SBOM · 취약점 · 빌드 재현성 → 보고서
+#
+# 단계는 supply-chain/run.sh 와 같다 (로컬에서도 같은 스크립트로 재현).
+#   실패시키는 것: API-BOM 게이트 — 소스의 라우트가 승인된 기준선(supply-chain/baseline.csv)과 다르거나,
+#                 API-BOM 이 CycloneDX 1.6 스키마를 통과하지 못할 때
+#   보고만 하는 것: 부품 취약점(S1) · 지원 종료(S3) · 빌드 재현성(B1~B4)
+# 결과: 실행 화면 Summary 에 보고서 전문, Artifacts(supply-chain-<번호>)에 SBOM·API-BOM·grype 원본
+
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * 1"   # 매주 월요일 09:00 KST — 소스가 같아도 취약점 DB 는 바뀐다
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 저장소 가져오기
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 파이썬 준비
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: 스키마 검증 라이브러리 설치
+        run: pip install "cyclonedx-python-lib[json-validation]==11.12.0"
+
+      - name: 파이프라인 실행 (API-BOM → SBOM → grype → 빌드 재현성 → 보고서)
+        run: bash supply-chain/run.sh supply-chain/out
+
+      - name: 보고서를 실행 요약에 붙이기
+        if: always()
+        run: cat supply-chain/out/report.md >> "$GITHUB_STEP_SUMMARY" || echo "보고서 없음" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 결과 파일 보관
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: supply-chain-${{ github.run_number }}
+          path: supply-chain/out/
+          if-no-files-found: warn
+          retention-days: 90

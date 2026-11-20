@@ -1,0 +1,5 @@
+endpoint_key,kind,auth,frontend,in_spec,source,decision,owner,note
+POST /api/v1/declaration,api,none,n,,app.py:92,active,관세API팀,수입 신고 접수
+GET /api/v1/health,api,none,n,,app.py:101,active,관세API팀,헬스 체크 (모니터링용)
+GET /api/v1/hs-code/{id},api,none,n,,app.py:76,active,관세API팀,HS 코드·관세율 조회 (공개 정보)
+GET /api/v1/import-stats/{id},api,none,n,,app.py:84,active,관세API팀,사용자별 수입 실적 조회 — 인증 없음(의도된 BOLA 실습 취약점)
